@@ -7,6 +7,7 @@ import { VoiceVisualizer } from './VoiceVisualizer';
 import { MessagePanel } from './MessagePanel';
 import { ControlPanel } from './ControlPanel';
 import OrbitalSphere from './AiGlobUi';
+import VoiceChat from '../VoiceChat';
 
 function AIAssistantContent() {
   return (
@@ -21,7 +22,8 @@ function AIAssistantContent() {
       {/* Main content area */}
      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
   <div className="pointer-events-auto">
-    <OrbitalSphere />
+    {/* <OrbitalSphere /> */}
+    <VoiceChat />
   </div>
 </div>
     </div>
