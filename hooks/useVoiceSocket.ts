@@ -4,6 +4,7 @@ const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws/voice2";
 const SAMPLE_RATE = 16000;
 const SILENCE_THRESHOLD = 0.002;
+const BARGE_IN_THRESHOLD = 0.0045;
 const SILENCE_DURATION_MS = 850;
 const SPEECH_HANGOVER_MS = 320;
 const TURN_DONE_TIMEOUT_MS = 30000;
@@ -18,6 +19,8 @@ export function useVoiceSocket(
   onTranscript?: (t: string) => void,
   onDone?: () => void,
   onTurnProcessing?: () => void,
+  onBargeInRequested?: () => void,
+  onBargeInAck?: () => void,
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
@@ -32,6 +35,8 @@ export function useVoiceSocket(
   const isConnectedRef = useRef(false);
   const isConnectingRef = useRef(false);
   const waitingForTurnDoneRef = useRef(false);
+  const assistantSpeakingRef = useRef(false);
+  const bargeInSentRef = useRef(false);
   const lastSpeechAtRef = useRef<number>(0);
   const frameCountRef = useRef(0);
   const sentChunkCountRef = useRef(0);
@@ -120,6 +125,8 @@ export function useVoiceSocket(
     isSpeakingRef.current = false;
     isConnectedRef.current = false;
     waitingForTurnDoneRef.current = false;
+    assistantSpeakingRef.current = false;
+    bargeInSentRef.current = false;
     turnDoneResolverRef.current = null;
 
     sourceRef.current?.disconnect();
@@ -231,6 +238,7 @@ export function useVoiceSocket(
             onToken(msg.data);
           }
           if (msg.type === "tts_sentence_start" && onTtsSentenceStart) {
+            assistantSpeakingRef.current = true;
             console.log("[ws] invoking onTtsSentenceStart");
             onTtsSentenceStart(String(msg.data?.text ?? ""));
           }
@@ -242,6 +250,10 @@ export function useVoiceSocket(
             });
           }
           if (msg.type === "audio_chunk") {
+            if (bargeInSentRef.current) {
+              debug("ignoring audio_chunk after barge-in request");
+              return;
+            }
             console.log(
               "[ws] invoking onAudioChunk, length:",
               msg.data?.length,
@@ -253,11 +265,22 @@ export function useVoiceSocket(
             onTranscript(msg.data);
           }
           if (msg.type === "done") {
+            assistantSpeakingRef.current = false;
+            bargeInSentRef.current = false;
             console.log("[ws] invoking onDone");
             resolveTurnDone();
             if (onDone) onDone();
           }
+          if (msg.type === "barge_in_ack") {
+            assistantSpeakingRef.current = false;
+            bargeInSentRef.current = false;
+            if (onBargeInAck) {
+              onBargeInAck();
+            }
+          }
           if (msg.type === "error") {
+            assistantSpeakingRef.current = false;
+            bargeInSentRef.current = false;
             resolveTurnDone();
             console.error("Server error:", msg.data);
           }
@@ -343,7 +366,22 @@ export function useVoiceSocket(
         }
         const rms = Math.sqrt(sumSquares / pcm.length);
         const speakingNow = rms > SILENCE_THRESHOLD;
+        const bargeInSpeakingNow = rms > BARGE_IN_THRESHOLD;
         const now = performance.now();
+
+        if (
+          bargeInSpeakingNow &&
+          assistantSpeakingRef.current &&
+          !bargeInSentRef.current &&
+          ws.readyState === WebSocket.OPEN
+        ) {
+          bargeInSentRef.current = true;
+          debug("sending barge_in", { rms, threshold: BARGE_IN_THRESHOLD });
+          if (onBargeInRequested) {
+            onBargeInRequested();
+          }
+          ws.send(JSON.stringify({ type: "barge_in" }));
+        }
 
         if (speakingNow) {
           lastSpeechAtRef.current = now;
@@ -406,6 +444,7 @@ export function useVoiceSocket(
             sentChunks: sentChunkCountRef.current,
             pcmLength: pcm.length,
             rms,
+            bargeInSpeakingNow,
             speakingNow,
             speaking,
           });
@@ -434,6 +473,8 @@ export function useVoiceSocket(
     onTranscript,
     onDone,
     onTurnProcessing,
+    onBargeInRequested,
+    onBargeInAck,
     resolveTurnDone,
   ]);
 

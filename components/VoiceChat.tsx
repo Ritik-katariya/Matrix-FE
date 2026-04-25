@@ -24,6 +24,7 @@ export default function VoiceChat() {
   const [playedSentences, setPlayedSentences] = useState(0);
   const pendingAudioChunksRef = useRef<Uint8Array[]>([]);
   const isTogglingRef = useRef(false);
+  const interruptionEpochRef = useRef(0);
 
   const { enqueueBytes, reset, unlock } = useAudioQueue();
 
@@ -67,6 +68,7 @@ export default function VoiceChat() {
   const handleTtsSentenceEnd = useCallback(
     async (info: { text: string; chunks: number }) => {
       console.log("[VoiceChat] handleTtsSentenceEnd called", info);
+      const epochAtStart = interruptionEpochRef.current;
       const totalLength = pendingAudioChunksRef.current.reduce(
         (sum, chunk) => sum + chunk.byteLength,
         0,
@@ -87,6 +89,10 @@ export default function VoiceChat() {
 
       console.log("[VoiceChat] playing merged audio, bytes:", totalLength);
       const played = await enqueueBytes(merged);
+      if (epochAtStart !== interruptionEpochRef.current) {
+        pushDebug("tts end ignored after interruption");
+        return;
+      }
       if (played) {
         setPlayedSentences((count) => count + 1);
         setStatus("listening");
@@ -121,6 +127,21 @@ export default function VoiceChat() {
     pushDebug("processing speech");
   }, [pushDebug]);
 
+  const handleBargeInRequested = useCallback(() => {
+    console.log("[VoiceChat] handleBargeInRequested called");
+    interruptionEpochRef.current += 1;
+    pendingAudioChunksRef.current = [];
+    reset();
+    setStatus("listening");
+    pushDebug("barge-in: stopping assistant audio");
+  }, [pushDebug, reset]);
+
+  const handleBargeInAck = useCallback(() => {
+    console.log("[VoiceChat] handleBargeInAck called");
+    setStatus("listening");
+    pushDebug("barge-in acknowledged");
+  }, [pushDebug]);
+
   const { connect, disconnect, endTurn } = useVoiceSocket(
     handleToken,
     handleAudioChunk,
@@ -129,6 +150,8 @@ export default function VoiceChat() {
     handleTranscript,
     handleDone,
     handleTurnProcessing,
+    handleBargeInRequested,
+    handleBargeInAck,
   );
 
   const toggle = async () => {
