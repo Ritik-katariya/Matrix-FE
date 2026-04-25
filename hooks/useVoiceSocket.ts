@@ -3,8 +3,9 @@ import { useRef, useCallback, useEffect } from "react";
 const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws/voice2";
 const SAMPLE_RATE = 16000;
-const SILENCE_THRESHOLD = 0.004;
-const SILENCE_DURATION_MS = 500;
+const SILENCE_THRESHOLD = 0.002;
+const SILENCE_DURATION_MS = 850;
+const SPEECH_HANGOVER_MS = 320;
 const TURN_DONE_TIMEOUT_MS = 30000;
 const DEBUG_VOICE = true;
 const LOG_EVERY_FRAMES = 25;
@@ -16,6 +17,7 @@ export function useVoiceSocket(
   onTtsSentenceEnd?: (info: { text: string; chunks: number }) => void,
   onTranscript?: (t: string) => void,
   onDone?: () => void,
+  onTurnProcessing?: () => void,
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
@@ -24,11 +26,13 @@ export function useVoiceSocket(
   const streamRef = useRef<MediaStream | null>(null);
   const sinkGainRef = useRef<GainNode | null>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnDoneTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnDoneResolverRef = useRef<(() => void) | null>(null);
   const isSpeakingRef = useRef(false);
   const isConnectedRef = useRef(false);
   const isConnectingRef = useRef(false);
   const waitingForTurnDoneRef = useRef(false);
+  const lastSpeechAtRef = useRef<number>(0);
   const frameCountRef = useRef(0);
   const sentChunkCountRef = useRef(0);
 
@@ -41,14 +45,22 @@ export function useVoiceSocket(
     console.log(`[voice-debug] ${message}`, data);
   }, []);
 
+  const clearTurnDoneTimeout = useCallback(() => {
+    if (turnDoneTimeoutRef.current) {
+      clearTimeout(turnDoneTimeoutRef.current);
+      turnDoneTimeoutRef.current = null;
+    }
+  }, []);
+
   const resolveTurnDone = useCallback(() => {
     waitingForTurnDoneRef.current = false;
+    clearTurnDoneTimeout();
     const resolver = turnDoneResolverRef.current;
     turnDoneResolverRef.current = null;
     if (resolver) {
       resolver();
     }
-  }, []);
+  }, [clearTurnDoneTimeout]);
 
   const endTurn = useCallback(
     async (waitForDone: boolean) => {
@@ -69,6 +81,15 @@ export function useVoiceSocket(
 
       debug("sending end_of_speech");
       waitingForTurnDoneRef.current = true;
+      if (onTurnProcessing) {
+        onTurnProcessing();
+      }
+
+      clearTurnDoneTimeout();
+      turnDoneTimeoutRef.current = setTimeout(() => {
+        debug("turn done timeout reached; resuming capture");
+        resolveTurnDone();
+      }, TURN_DONE_TIMEOUT_MS);
 
       let donePromise: Promise<void> | null = null;
       if (waitForDone) {
@@ -83,17 +104,9 @@ export function useVoiceSocket(
         return;
       }
 
-      await Promise.race([
-        donePromise,
-        new Promise<void>((resolve) => {
-          setTimeout(resolve, TURN_DONE_TIMEOUT_MS);
-        }),
-      ]);
-
-      // In case of timeout, allow a future endTurn attempt.
-      waitingForTurnDoneRef.current = false;
+      await donePromise;
     },
-    [debug],
+    [clearTurnDoneTimeout, debug, onTurnProcessing, resolveTurnDone],
   );
 
   const cleanupSession = useCallback((closeSocket: boolean) => {
@@ -101,6 +114,8 @@ export function useVoiceSocket(
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
+
+    clearTurnDoneTimeout();
 
     isSpeakingRef.current = false;
     isConnectedRef.current = false;
@@ -243,7 +258,7 @@ export function useVoiceSocket(
             if (onDone) onDone();
           }
           if (msg.type === "error") {
-            waitingForTurnDoneRef.current = false;
+            resolveTurnDone();
             console.error("Server error:", msg.data);
           }
         } catch (err) {
@@ -327,7 +342,15 @@ export function useVoiceSocket(
           sumSquares += pcm[i] * pcm[i];
         }
         const rms = Math.sqrt(sumSquares / pcm.length);
-        const speaking = rms > SILENCE_THRESHOLD;
+        const speakingNow = rms > SILENCE_THRESHOLD;
+        const now = performance.now();
+
+        if (speakingNow) {
+          lastSpeechAtRef.current = now;
+        }
+
+        const speaking =
+          speakingNow || now - lastSpeechAtRef.current < SPEECH_HANGOVER_MS;
 
         if (speaking) {
           if (!isSpeakingRef.current) {
@@ -383,6 +406,7 @@ export function useVoiceSocket(
             sentChunks: sentChunkCountRef.current,
             pcmLength: pcm.length,
             rms,
+            speakingNow,
             speaking,
           });
         }
@@ -399,6 +423,7 @@ export function useVoiceSocket(
       isConnectingRef.current = false;
     }
   }, [
+    clearTurnDoneTimeout,
     cleanupSession,
     debug,
     endTurn,
@@ -408,6 +433,7 @@ export function useVoiceSocket(
     onTtsSentenceEnd,
     onTranscript,
     onDone,
+    onTurnProcessing,
     resolveTurnDone,
   ]);
 

@@ -115,6 +115,12 @@ export default function VoiceChat() {
     pushDebug("turn done");
   }, [pushDebug]);
 
+  const handleTurnProcessing = useCallback(() => {
+    console.log("[VoiceChat] handleTurnProcessing called");
+    setStatus("thinking");
+    pushDebug("processing speech");
+  }, [pushDebug]);
+
   const { connect, disconnect, endTurn } = useVoiceSocket(
     handleToken,
     handleAudioChunk,
@@ -122,6 +128,7 @@ export default function VoiceChat() {
     handleTtsSentenceEnd,
     handleTranscript,
     handleDone,
+    handleTurnProcessing,
   );
 
   const toggle = async () => {
@@ -156,9 +163,9 @@ export default function VoiceChat() {
         // CRITICAL: unlock AudioContext from inside user gesture
         await unlock();
 
-        setStatus("listening");
         try {
           await connect();
+          setStatus("listening");
         } catch (err) {
           console.error("Failed to connect:", err);
           setIsActive(false);
