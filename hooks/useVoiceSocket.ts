@@ -3,11 +3,16 @@ import { useRef, useCallback, useEffect } from "react";
 const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws/voice2";
 const SAMPLE_RATE = 16000;
-const SILENCE_THRESHOLD = 0.002;
+const SILENCE_THRESHOLD = 0.0016;
 const BARGE_IN_THRESHOLD = 0.0045;
-const SILENCE_DURATION_MS = 850;
-const SPEECH_HANGOVER_MS = 320;
+const SILENCE_DURATION_MS = 1100;
+const SPEECH_HANGOVER_MS = 520;
+const MIN_SPEECH_START_MS = 60;
 const TURN_DONE_TIMEOUT_MS = 30000;
+const PRE_ROLL_MS = 420;
+const NOISE_FLOOR_ALPHA = 0.03;
+const NOISE_FLOOR_MULTIPLIER = 2.4;
+const BARGE_IN_NOISE_MULTIPLIER = 5.5;
 const DEBUG_VOICE = true;
 const LOG_EVERY_FRAMES = 25;
 
@@ -24,6 +29,7 @@ export function useVoiceSocket(
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
+  const nativeSampleRateRef = useRef<number>(SAMPLE_RATE);
   const workletRef = useRef<AudioWorkletNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -38,6 +44,13 @@ export function useVoiceSocket(
   const assistantSpeakingRef = useRef(false);
   const bargeInSentRef = useRef(false);
   const lastSpeechAtRef = useRef<number>(0);
+  const speechStartCandidateAtRef = useRef<number | null>(null);
+  const noiseFloorRef = useRef<number>(SILENCE_THRESHOLD * 0.6);
+  const hpLastXRef = useRef<number>(0);
+  const hpLastYRef = useRef<number>(0);
+  const preRollFramesRef = useRef<Int16Array[]>([]);
+  const preRollSamplesRef = useRef<number>(0);
+  const speechSendingRef = useRef<boolean>(false);
   const frameCountRef = useRef(0);
   const sentChunkCountRef = useRef(0);
 
@@ -66,6 +79,91 @@ export function useVoiceSocket(
       resolver();
     }
   }, [clearTurnDoneTimeout]);
+
+  const computeHighpassRms = useCallback((pcm: Float32Array) => {
+    // 1st-order high-pass filter (~120Hz) to reduce low-frequency rumble.
+    // y[n] = a * (y[n-1] + x[n] - x[n-1])
+    const cutoffHz = 120;
+    const dt = 1 / SAMPLE_RATE;
+    const rc = 1 / (2 * Math.PI * cutoffHz);
+    const a = rc / (rc + dt);
+
+    let lastX = hpLastXRef.current;
+    let lastY = hpLastYRef.current;
+
+    let sumSquares = 0;
+    for (let i = 0; i < pcm.length; i++) {
+      const x = pcm[i];
+      const y = a * (lastY + x - lastX);
+      lastX = x;
+      lastY = y;
+      sumSquares += y * y;
+    }
+
+    hpLastXRef.current = lastX;
+    hpLastYRef.current = lastY;
+
+    return Math.sqrt(sumSquares / pcm.length);
+  }, []);
+
+  const downsampleTo16k = useCallback(
+    (input: Float32Array, fromRate: number) => {
+      if (!input.length || fromRate === SAMPLE_RATE) {
+        return input;
+      }
+
+      // Linear interpolation resampling.
+      // This is noticeably more accurate than nearest-neighbor for speech.
+      const ratio = fromRate / SAMPLE_RATE;
+      const outLen = Math.max(1, Math.floor(input.length / ratio));
+      const out = new Float32Array(outLen);
+
+      for (let i = 0; i < outLen; i++) {
+        const t = i * ratio;
+        const idx = Math.floor(t);
+        const frac = t - idx;
+
+        const s0 = input[idx] ?? 0;
+        const s1 = input[Math.min(idx + 1, input.length - 1)] ?? s0;
+        out[i] = s0 + (s1 - s0) * frac;
+      }
+
+      return out;
+    },
+    [],
+  );
+
+  const pushPreRoll = useCallback((frame: Int16Array) => {
+    const maxSamples = Math.floor((SAMPLE_RATE * PRE_ROLL_MS) / 1000);
+    preRollFramesRef.current.push(frame);
+    preRollSamplesRef.current += frame.length;
+    while (
+      preRollSamplesRef.current > maxSamples &&
+      preRollFramesRef.current.length
+    ) {
+      const dropped = preRollFramesRef.current.shift();
+      if (dropped) {
+        preRollSamplesRef.current -= dropped.length;
+      }
+    }
+  }, []);
+
+  const flushPreRoll = useCallback((ws: WebSocket) => {
+    for (const frame of preRollFramesRef.current) {
+      try {
+        const buf = frame.buffer.slice(
+          frame.byteOffset,
+          frame.byteOffset + frame.byteLength,
+        ) as ArrayBuffer;
+        ws.send(buf);
+        sentChunkCountRef.current += 1;
+      } catch {
+        break;
+      }
+    }
+    preRollFramesRef.current = [];
+    preRollSamplesRef.current = 0;
+  }, []);
 
   const endTurn = useCallback(
     async (waitForDone: boolean) => {
@@ -127,6 +225,7 @@ export function useVoiceSocket(
     waitingForTurnDoneRef.current = false;
     assistantSpeakingRef.current = false;
     bargeInSentRef.current = false;
+    speechStartCandidateAtRef.current = null;
     turnDoneResolverRef.current = null;
 
     sourceRef.current?.disconnect();
@@ -234,15 +333,27 @@ export function useVoiceSocket(
           }
 
           if (msg.type === "token") {
+            if (bargeInSentRef.current) {
+              debug("ignoring token after barge-in request");
+              return;
+            }
             console.log("[ws] invoking onToken");
             onToken(msg.data);
           }
           if (msg.type === "tts_sentence_start" && onTtsSentenceStart) {
+            if (bargeInSentRef.current) {
+              debug("ignoring tts_sentence_start after barge-in request");
+              return;
+            }
             assistantSpeakingRef.current = true;
             console.log("[ws] invoking onTtsSentenceStart");
             onTtsSentenceStart(String(msg.data?.text ?? ""));
           }
           if (msg.type === "tts_sentence_end" && onTtsSentenceEnd) {
+            if (bargeInSentRef.current) {
+              debug("ignoring tts_sentence_end after barge-in request");
+              return;
+            }
             console.log("[ws] invoking onTtsSentenceEnd");
             onTtsSentenceEnd({
               text: String(msg.data?.text ?? ""),
@@ -274,6 +385,7 @@ export function useVoiceSocket(
           if (msg.type === "barge_in_ack") {
             assistantSpeakingRef.current = false;
             bargeInSentRef.current = false;
+            resolveTurnDone();
             if (onBargeInAck) {
               onBargeInAck();
             }
@@ -301,7 +413,8 @@ export function useVoiceSocket(
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          // AGC often amplifies distant/background sounds; prefer relying on VAD thresholds.
+          autoGainControl: false,
         },
       });
       streamRef.current = stream;
@@ -313,10 +426,18 @@ export function useVoiceSocket(
 
       const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
       contextRef.current = ctx;
+      nativeSampleRateRef.current = ctx.sampleRate;
       debug("audio context created", {
         sampleRate: ctx.sampleRate,
         state: ctx.state,
       });
+
+      if (ctx.sampleRate !== SAMPLE_RATE) {
+        debug("audio context sampleRate mismatch; will downsample", {
+          requested: SAMPLE_RATE,
+          actual: ctx.sampleRate,
+        });
+      }
 
       if (ctx.state === "suspended") {
         await ctx.resume();
@@ -335,14 +456,6 @@ export function useVoiceSocket(
       worklet.port.onmessage = (ev) => {
         frameCountRef.current += 1;
 
-        // While server processes current turn, stop feeding more PCM.
-        if (waitingForTurnDoneRef.current) {
-          if (frameCountRef.current % LOG_EVERY_FRAMES === 0) {
-            debug("worklet paused: waiting for turn done");
-          }
-          return;
-        }
-
         if (ws.readyState !== WebSocket.OPEN) {
           if (frameCountRef.current % LOG_EVERY_FRAMES === 0) {
             debug("worklet frame dropped: websocket not open", {
@@ -360,13 +473,30 @@ export function useVoiceSocket(
           return;
         }
 
-        let sumSquares = 0;
-        for (let i = 0; i < pcm.length; i++) {
-          sumSquares += pcm[i] * pcm[i];
+        const nativeRate = nativeSampleRateRef.current;
+        const pcm16k =
+          nativeRate === SAMPLE_RATE ? pcm : downsampleTo16k(pcm, nativeRate);
+        const rms = computeHighpassRms(pcm16k);
+
+        // Update adaptive noise floor when we appear to be in silence.
+        // (Use a low alpha so it adapts slowly; avoids chasing speech.)
+        if (!assistantSpeakingRef.current && !isSpeakingRef.current) {
+          const nf = noiseFloorRef.current;
+          noiseFloorRef.current =
+            nf + NOISE_FLOOR_ALPHA * (Math.min(rms, 0.02) - nf);
         }
-        const rms = Math.sqrt(sumSquares / pcm.length);
-        const speakingNow = rms > SILENCE_THRESHOLD;
-        const bargeInSpeakingNow = rms > BARGE_IN_THRESHOLD;
+
+        const dynamicSilenceThreshold = Math.max(
+          SILENCE_THRESHOLD,
+          noiseFloorRef.current * NOISE_FLOOR_MULTIPLIER,
+        );
+        const dynamicBargeInThreshold = Math.max(
+          BARGE_IN_THRESHOLD,
+          noiseFloorRef.current * BARGE_IN_NOISE_MULTIPLIER,
+        );
+
+        const speakingNow = rms > dynamicSilenceThreshold;
+        const bargeInSpeakingNow = rms > dynamicBargeInThreshold;
         const now = performance.now();
 
         if (
@@ -376,6 +506,9 @@ export function useVoiceSocket(
           ws.readyState === WebSocket.OPEN
         ) {
           bargeInSentRef.current = true;
+          // We are explicitly cancelling the current assistant turn.
+          // Release any "waiting for done" gating immediately so we can end this new user turn.
+          resolveTurnDone();
           debug("sending barge_in", { rms, threshold: BARGE_IN_THRESHOLD });
           if (onBargeInRequested) {
             onBargeInRequested();
@@ -384,7 +517,16 @@ export function useVoiceSocket(
         }
 
         if (speakingNow) {
-          lastSpeechAtRef.current = now;
+          if (speechStartCandidateAtRef.current === null) {
+            speechStartCandidateAtRef.current = now;
+          }
+
+          const sustainedSpeechMs = now - speechStartCandidateAtRef.current;
+          if (sustainedSpeechMs >= MIN_SPEECH_START_MS) {
+            lastSpeechAtRef.current = now;
+          }
+        } else {
+          speechStartCandidateAtRef.current = null;
         }
 
         const speaking =
@@ -407,16 +549,23 @@ export function useVoiceSocket(
             silenceTimerRef.current = setTimeout(() => {
               isSpeakingRef.current = false;
               silenceTimerRef.current = null;
+              speechSendingRef.current = false;
+              preRollFramesRef.current = [];
+              preRollSamplesRef.current = 0;
               void endTurn(false);
             }, SILENCE_DURATION_MS);
           }
         }
 
         // Stream every frame so server-side VAD can decide speech boundaries.
-        const int16 = new Int16Array(pcm.length);
-        for (let i = 0; i < pcm.length; i++) {
-          int16[i] = Math.max(-32768, Math.min(32767, pcm[i] * 32768));
+        const int16 = new Int16Array(pcm16k.length);
+        for (let i = 0; i < pcm16k.length; i++) {
+          int16[i] = Math.max(-32768, Math.min(32767, pcm16k[i] * 32768));
         }
+
+        // Stream every frame once connected so speech is never missed by client VAD.
+        // VAD still controls barge-in and end-of-turn timing, but not whether audio is sent.
+        const shouldSendAudio = ws.readyState === WebSocket.OPEN;
 
         if (ws.readyState !== WebSocket.OPEN) {
           if (frameCountRef.current % LOG_EVERY_FRAMES === 0) {
@@ -430,7 +579,17 @@ export function useVoiceSocket(
         }
 
         try {
-          ws.send(int16.buffer);
+          if (!speechSendingRef.current) {
+            flushPreRoll(ws);
+            speechSendingRef.current = true;
+          }
+          const buf = int16.buffer.slice(
+            int16.byteOffset,
+            int16.byteOffset + int16.byteLength,
+          ) as ArrayBuffer;
+          if (shouldSendAudio) {
+            ws.send(buf);
+          }
         } catch (err) {
           console.error("[worklet.send] Error sending PCM frame", err, {
             readyState: ws.readyState,
@@ -447,6 +606,8 @@ export function useVoiceSocket(
             bargeInSpeakingNow,
             speakingNow,
             speaking,
+            noiseFloor: noiseFloorRef.current,
+            dynamicSilenceThreshold,
           });
         }
       };
